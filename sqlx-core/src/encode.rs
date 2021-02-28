@@ -24,12 +24,21 @@ pub enum IsNull {
 pub trait Encode<Db: Database>: Send + Sync {
     /// Encode this value into the specified SQL type.
     fn encode(&self, ty: &Db::TypeInfo, out: &mut <Db as HasOutput<'_>>::Output) -> Result;
+
+    /// If this type is a vector, get its length.
+    fn vector_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl<T: Encode<Db>, Db: Database> Encode<Db> for &T {
     #[inline]
     fn encode(&self, ty: &Db::TypeInfo, out: &mut <Db as HasOutput<'_>>::Output) -> Result {
         (*self).encode(ty, out)
+    }
+    
+    fn vector_len(&self) -> Option<usize> {
+        (*self).vector_len()
     }
 }
 
