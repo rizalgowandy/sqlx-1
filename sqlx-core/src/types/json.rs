@@ -1,8 +1,8 @@
 use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue as JsonRawValue;
-use serde_json::Value as JsonValue;
+pub use serde_json::value::RawValue as JsonRawValue;
+pub use serde_json::Value as JsonValue;
 
 use crate::database::{Database, HasArguments, HasValueRef};
 use crate::decode::Decode;
@@ -53,34 +53,6 @@ where
 
     fn compatible(ty: &DB::TypeInfo) -> bool {
         <Json<Self> as Type<DB>>::compatible(ty)
-    }
-}
-
-impl<DB> Type<DB> for Vec<JsonValue>
-where
-    Vec<Json<JsonValue>>: Type<DB>,
-    DB: Database,
-{
-    fn type_info() -> DB::TypeInfo {
-        <Vec<Json<JsonValue>> as Type<DB>>::type_info()
-    }
-
-    fn compatible(ty: &DB::TypeInfo) -> bool {
-        <Vec<Json<JsonValue>> as Type<DB>>::compatible(ty)
-    }
-}
-
-impl<DB> Type<DB> for [JsonValue]
-where
-    [Json<JsonValue>]: Type<DB>,
-    DB: Database,
-{
-    fn type_info() -> DB::TypeInfo {
-        <[Json<JsonValue>] as Type<DB>>::type_info()
-    }
-
-    fn compatible(ty: &DB::TypeInfo) -> bool {
-        <[Json<JsonValue>] as Type<DB>>::compatible(ty)
     }
 }
 

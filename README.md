@@ -197,11 +197,11 @@ some info on) your SQL queries. This has some potentially surprising implication
 - Due to the different amount of information databases let you retrieve about queries, the extent of
   SQL verification you get from the query macros depends on the database
 
-**If you are looking for an (asynchronous) ORM,** you can check out [`ormx`], which is built on top
+**If you are looking for an (asynchronous) ORM,** you can check out [`ormx`] or [`SeaORM`], which is built on top
 of SQLx.
 
 [`ormx`]: https://crates.io/crates/ormx
-
+[`SeaORM`]: https://github.com/SeaQL/sea-orm
 ## Usage
 
 See the `examples/` folder for more in-depth usage.
@@ -412,6 +412,16 @@ To avoid the need of having a development database around to compile the project
 modifications (to the database-accessing parts of the code) are done, you can enable "offline mode"
 to cache the results of the SQL query analysis using the `sqlx` command-line tool. See
 [sqlx-cli/README.md](./sqlx-cli/README.md#enable-building-in-offline-mode-with-query).
+
+Compile time verified queries do quite a bit of work at compile time. Incremental actions like
+`cargo check` and `cargo build` can be significantly faster when using an optimized build by
+putting the following in your `Cargo.toml` (More information in the
+[Profiles section](https://doc.rust-lang.org/cargo/reference/profiles.html) of The Cargo Book)
+
+```toml
+[profile.dev.package.sqlx-macros]
+opt-level = 3
+```
 
 ## Safety
 

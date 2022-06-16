@@ -1,8 +1,10 @@
+use crate::opt::ConnectOpts;
 use anyhow::{bail, Context};
 use console::style;
 use remove_dir_all::remove_dir_all;
 use serde::Deserialize;
 use sqlx::any::{AnyConnectOptions, AnyKind};
+use sqlx::Connection;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -22,9 +24,18 @@ struct DataFile {
     data: QueryData,
 }
 
-pub fn run(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<()> {
+pub async fn run(
+    connect_opts: &ConnectOpts,
+    merge: bool,
+    cargo_args: Vec<String>,
+) -> anyhow::Result<()> {
+    // Ensure the database server is available.
+    crate::connect(connect_opts).await?.close().await?;
+
+    let url = &connect_opts.database_url;
+
     let db_kind = get_db_kind(url)?;
-    let data = run_prepare_step(merge, cargo_args)?;
+    let data = run_prepare_step(url, merge, cargo_args)?;
 
     if data.is_empty() {
         println!(
@@ -52,9 +63,18 @@ pub fn run(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<()
     Ok(())
 }
 
-pub fn check(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<()> {
+pub async fn check(
+    connect_opts: &ConnectOpts,
+    merge: bool,
+    cargo_args: Vec<String>,
+) -> anyhow::Result<()> {
+    // Ensure the database server is available.
+    crate::connect(connect_opts).await?.close().await?;
+
+    let url = &connect_opts.database_url;
+
     let db_kind = get_db_kind(url)?;
-    let data = run_prepare_step(merge, cargo_args)?;
+    let data = run_prepare_step(url, merge, cargo_args)?;
 
     let data_file = File::open("sqlx-data.json").context(
         "failed to open `sqlx-data.json`; you may need to run `cargo sqlx prepare` first",
@@ -80,7 +100,7 @@ pub fn check(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<
     Ok(())
 }
 
-fn run_prepare_step(merge: bool, cargo_args: Vec<String>) -> anyhow::Result<QueryData> {
+fn run_prepare_step(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<QueryData> {
     anyhow::ensure!(
         Path::new("Cargo.toml").exists(),
         r#"Failed to read `Cargo.toml`.
@@ -115,17 +135,18 @@ hint: This command only works in the manifest directory of a Cargo package."#
             bail!("`cargo clean` failed with status: {}", check_status);
         }
 
+        let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+        rustflags.push_str(&format!(
+            " --cfg __sqlx_recompile_trigger=\"{}\"",
+            SystemTime::UNIX_EPOCH.elapsed()?.as_millis()
+        ));
+
         Command::new(&cargo)
             .arg("check")
             .args(cargo_args)
-            .env(
-                "RUSTFLAGS",
-                format!(
-                    "--cfg __sqlx_recompile_trigger=\"{}\"",
-                    SystemTime::UNIX_EPOCH.elapsed()?.as_millis()
-                ),
-            )
+            .env("RUSTFLAGS", rustflags)
             .env("SQLX_OFFLINE", "false")
+            .env("DATABASE_URL", url)
             .status()?
     } else {
         Command::new(&cargo)
@@ -141,6 +162,7 @@ hint: This command only works in the manifest directory of a Cargo package."#
                 SystemTime::UNIX_EPOCH.elapsed()?.as_millis()
             ))
             .env("SQLX_OFFLINE", "false")
+            .env("DATABASE_URL", url)
             .status()?
     };
 

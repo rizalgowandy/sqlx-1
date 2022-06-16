@@ -1,11 +1,13 @@
 use futures::{StreamExt, TryStreamExt};
+use sqlx::postgres::types::Oid;
 use sqlx::postgres::{
-    PgConnectOptions, PgConnection, PgDatabaseError, PgErrorPosition, PgSeverity,
+    PgAdvisoryLock, PgConnectOptions, PgConnection, PgDatabaseError, PgErrorPosition, PgListener,
+    PgPoolOptions, PgRow, PgSeverity, Postgres,
 };
-use sqlx::postgres::{PgConnectionInfo, PgPoolOptions, PgRow, Postgres};
 use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
-use sqlx_test::{new, setup_if_needed};
+use sqlx_test::{new, pool, setup_if_needed};
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[sqlx_macros::test]
@@ -39,6 +41,39 @@ async fn it_pings() -> anyhow::Result<()> {
     let mut conn = new::<Postgres>().await?;
 
     conn.ping().await?;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_pings_after_suspended_query() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+
+    conn.execute("create temporary table processed_row(val int4 primary key)")
+        .await?;
+
+    // This query wants to return 50 rows but we only read the first one.
+    // This will return a `SuspendedPortal` that the driver currently ignores.
+    let _: i32 = sqlx::query_scalar(
+        r#"
+            insert into processed_row(val)
+            select * from generate_series(1, 50)
+            returning val
+        "#,
+    )
+    .fetch_one(&mut conn)
+    .await?;
+
+    // `Sync` closes the current autocommit transaction which presumably includes closing any
+    // suspended portals.
+    conn.ping().await?;
+
+    // Make sure that all the values got inserted even though we only read the first one back.
+    let count: i64 = sqlx::query_scalar("select count(*) from processed_row")
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(count, 50);
 
     Ok(())
 }
@@ -332,7 +367,7 @@ async fn it_can_query_scalar() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
-/// This is seperate from `it_can_query_scalar` because while implementing it I ran into a
+/// This is separate from `it_can_query_scalar` because while implementing it I ran into a
 /// bug which that prevented `Vec<i32>` from compiling but allowed Vec<Option<i32>>.
 async fn it_can_query_all_scalar() -> anyhow::Result<()> {
     let mut conn = new::<Postgres>().await?;
@@ -509,7 +544,7 @@ async fn pool_smoke_test() -> anyhow::Result<()> {
     eprintln!("starting pool");
 
     let pool = PgPoolOptions::new()
-        .connect_timeout(Duration::from_secs(5))
+        .acquire_timeout(Duration::from_secs(5))
         .min_connections(1)
         .max_connections(1)
         .connect(&dotenv::var("DATABASE_URL")?)
@@ -660,14 +695,14 @@ async fn it_caches_statements() -> anyhow::Result<()> {
 
     for i in 0..2 {
         let row = sqlx::query("SELECT $1 AS val")
-            .bind(i)
+            .bind(Oid(i))
             .persistent(true)
             .fetch_one(&mut conn)
             .await?;
 
-        let val: u32 = row.get("val");
+        let val: Oid = row.get("val");
 
-        assert_eq!(i, val);
+        assert_eq!(Oid(i), val);
     }
 
     assert_eq!(1, conn.cached_statements_size());
@@ -676,14 +711,14 @@ async fn it_caches_statements() -> anyhow::Result<()> {
 
     for i in 0..2 {
         let row = sqlx::query("SELECT $1 AS val")
-            .bind(i)
+            .bind(Oid(i))
             .persistent(false)
             .fetch_one(&mut conn)
             .await?;
 
-        let val: u32 = row.get("val");
+        let val: Oid = row.get("val");
 
-        assert_eq!(i, val);
+        assert_eq!(Oid(i), val);
     }
 
     assert_eq!(0, conn.cached_statements_size());
@@ -839,8 +874,8 @@ async fn test_describe_outer_join_nullable() -> anyhow::Result<()> {
     let describe = conn
         .describe(
             "select tweet.id
-from (values (null)) vals(val)
-         inner join tweet on false",
+    from tweet
+    inner join products on products.name = tweet.text",
         )
         .await?;
 
@@ -967,6 +1002,23 @@ async fn test_listener_cleanup() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
+async fn test_pg_listener_allows_pool_to_close() -> anyhow::Result<()> {
+    let pool = pool::<Postgres>().await?;
+
+    // acquires and holds a connection which would normally prevent the pool from closing
+    let mut listener = PgListener::connect_with(&pool).await?;
+
+    sqlx_rt::spawn(async move {
+        listener.recv().await.unwrap();
+    });
+
+    // would previously hang forever since `PgListener` had no way to know the pool wanted to close
+    pool.close().await;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn it_supports_domain_types_in_composite_domain_types() -> anyhow::Result<()> {
     // Only supported in Postgres 11+
     let mut conn = new::<Postgres>().await?;
@@ -1018,7 +1070,7 @@ CREATE TABLE heating_bills (
             &self,
             buf: &mut sqlx::postgres::PgArgumentBuffer,
         ) -> sqlx::encode::IsNull {
-            self.0.encode(buf)
+            <i16 as sqlx::Encode<Postgres>>::encode(self.0, buf)
         }
     }
 
@@ -1095,9 +1147,249 @@ CREATE TABLE heating_bills (
 }
 
 #[sqlx_macros::test]
-async fn test_pg_server_num() -> anyhow::Result<()> {
-    use sqlx::postgres::PgConnectionInfo;
+async fn it_resolves_custom_type_in_array() -> anyhow::Result<()> {
+    // Only supported in Postgres 11+
+    let mut conn = new::<Postgres>().await?;
+    if matches!(conn.server_version_num(), Some(version) if version < 110000) {
+        return Ok(());
+    }
 
+    // language=PostgreSQL
+    conn.execute(
+        r#"
+DROP TABLE IF EXISTS pets;
+DROP TYPE IF EXISTS pet_name_and_race;
+
+CREATE TYPE pet_name_and_race AS (
+  name TEXT,
+  race TEXT
+);
+CREATE TABLE pets (
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  race TEXT NOT NULL,
+  PRIMARY KEY (owner, name)
+);
+INSERT INTO pets(owner, name, race)
+VALUES
+  ('Alice', 'Foo', 'cat');
+INSERT INTO pets(owner, name, race)
+VALUES
+  ('Alice', 'Bar', 'dog');
+    "#,
+    )
+    .await?;
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PetNameAndRace {
+        name: String,
+        race: String,
+    }
+
+    impl sqlx::Type<Postgres> for PetNameAndRace {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_name("pet_name_and_race")
+        }
+    }
+
+    impl<'r> sqlx::Decode<'r, Postgres> for PetNameAndRace {
+        fn decode(
+            value: sqlx::postgres::PgValueRef<'r>,
+        ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+            let mut decoder = sqlx::postgres::types::PgRecordDecoder::new(value)?;
+            let name = decoder.try_decode::<String>()?;
+            let race = decoder.try_decode::<String>()?;
+            Ok(Self { name, race })
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PetNameAndRaceArray(Vec<PetNameAndRace>);
+
+    impl sqlx::Type<Postgres> for PetNameAndRaceArray {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            // Array type name is the name of the element type prefixed with `_`
+            sqlx::postgres::PgTypeInfo::with_name("_pet_name_and_race")
+        }
+    }
+
+    impl<'r> sqlx::Decode<'r, Postgres> for PetNameAndRaceArray {
+        fn decode(
+            value: sqlx::postgres::PgValueRef<'r>,
+        ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+            Ok(Self(Vec::<PetNameAndRace>::decode(value)?))
+        }
+    }
+
+    let mut conn = new::<Postgres>().await?;
+
+    let row = sqlx::query("select owner, array_agg(row(name, race)::pet_name_and_race) as pets from pets group by owner")
+        .fetch_one(&mut conn)
+        .await?;
+
+    let pets: PetNameAndRaceArray = row.get("pets");
+
+    assert_eq!(pets.0.len(), 2);
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_resolves_custom_types_in_anonymous_records() -> anyhow::Result<()> {
+    use sqlx_core::error::Error;
+    // This request involves nested records and array types.
+
+    // Only supported in Postgres 11+
+    let mut conn = new::<Postgres>().await?;
+    if matches!(conn.server_version_num(), Some(version) if version < 110000) {
+        return Ok(());
+    }
+
+    // language=PostgreSQL
+    conn.execute(
+        r#"
+DROP TABLE IF EXISTS repo_users;
+DROP TABLE IF EXISTS repositories;
+DROP TABLE IF EXISTS repo_memberships;
+DROP TYPE IF EXISTS repo_member;
+
+CREATE TABLE repo_users (
+  user_id INT4 NOT NULL,
+  username TEXT NOT NULL,
+  PRIMARY KEY (user_id)
+);
+CREATE TABLE repositories (
+  repo_id INT4 NOT NULL,
+  repo_name TEXT NOT NULL,
+  PRIMARY KEY (repo_id)
+);
+CREATE TABLE repo_memberships (
+  repo_id INT4 NOT NULL,
+  user_id INT4 NOT NULL,
+  permission TEXT NOT NULL,
+  PRIMARY KEY (repo_id, user_id)
+);
+CREATE TYPE repo_member AS (
+  user_id INT4,
+  permission TEXT
+);
+INSERT INTO repo_users(user_id, username)
+VALUES
+  (101, 'alice'),
+  (102, 'bob'),
+  (103, 'charlie');
+INSERT INTO repositories(repo_id, repo_name)
+VALUES
+  (201, 'rust'),
+  (202, 'sqlx'),
+  (203, 'hello-world');
+INSERT INTO repo_memberships(repo_id, user_id, permission)
+VALUES
+  (201, 101, 'admin'),
+  (201, 102, 'write'),
+  (201, 103, 'read'),
+  (202, 102, 'admin');
+"#,
+    )
+    .await?;
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct RepoMember {
+        user_id: i32,
+        permission: String,
+    }
+
+    impl sqlx::Type<Postgres> for RepoMember {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_name("repo_member")
+        }
+    }
+
+    impl<'r> sqlx::Decode<'r, Postgres> for RepoMember {
+        fn decode(
+            value: sqlx::postgres::PgValueRef<'r>,
+        ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+            let mut decoder = sqlx::postgres::types::PgRecordDecoder::new(value)?;
+            let user_id = decoder.try_decode::<i32>()?;
+            let permission = decoder.try_decode::<String>()?;
+            Ok(Self {
+                user_id,
+                permission,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct RepoMemberArray(Vec<RepoMember>);
+
+    impl sqlx::Type<Postgres> for RepoMemberArray {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            // Array type name is the name of the element type prefixed with `_`
+            sqlx::postgres::PgTypeInfo::with_name("_repo_member")
+        }
+    }
+
+    impl<'r> sqlx::Decode<'r, Postgres> for RepoMemberArray {
+        fn decode(
+            value: sqlx::postgres::PgValueRef<'r>,
+        ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+            Ok(Self(Vec::<RepoMember>::decode(value)?))
+        }
+    }
+
+    let mut conn = new::<Postgres>().await?;
+
+    #[derive(Debug, sqlx::FromRow)]
+    #[allow(dead_code)] // We don't actually read these fields.
+    struct Row {
+        count: i64,
+        items: Vec<(i32, String, RepoMemberArray)>,
+    }
+    // language=PostgreSQL
+    let row: Result<Row, Error> = sqlx::query_as::<_, Row>(
+        r"
+        WITH
+          members_by_repo AS (
+            SELECT repo_id,
+              ARRAY_AGG(ROW (user_id, permission)::repo_member) AS members
+            FROM repo_memberships
+            GROUP BY repo_id
+          ),
+          repos AS (
+            SELECT repo_id, repo_name, COALESCE(members, '{}') AS members
+            FROM repositories
+              LEFT OUTER JOIN members_by_repo USING (repo_id)
+            ORDER BY repo_id
+          ),
+          repo_array AS (
+            SELECT COALESCE(ARRAY_AGG(repos.*), '{}') AS items
+            FROM repos
+          ),
+          repo_count AS (
+            SELECT COUNT(*) AS count
+            FROM repos
+          )
+        SELECT count, items
+        FROM repo_count, repo_array
+        ;
+    ",
+    )
+    .fetch_one(&mut conn)
+    .await;
+
+    // This test currently tests mitigations for `#1672` (use regular errors
+    // instead of panics). Once we fully support custom types, it should be
+    // updated accordingly.
+    match row {
+        Ok(_) => panic!("full support for custom types is not implemented yet"),
+        Err(e) => assert!(e
+            .to_string()
+            .contains("custom types in records are not fully supported yet")),
+    }
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn test_pg_server_num() -> anyhow::Result<()> {
     let conn = new::<Postgres>().await?;
 
     assert!(conn.server_version_num().is_some());
@@ -1202,6 +1494,128 @@ async fn it_can_copy_out() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
+async fn it_encodes_custom_array_issue_1504() -> anyhow::Result<()> {
+    use sqlx::encode::IsNull;
+    use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo};
+    use sqlx::{Decode, Encode, Type, ValueRef};
+
+    #[derive(Debug, PartialEq)]
+    enum Value {
+        String(String),
+        Number(i32),
+        Array(Vec<Value>),
+    }
+
+    impl<'r> Decode<'r, Postgres> for Value {
+        fn decode(
+            value: sqlx::postgres::PgValueRef<'r>,
+        ) -> std::result::Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+            let typ = value.type_info().into_owned();
+
+            if typ == PgTypeInfo::with_name("text") {
+                let s = <String as Decode<'_, Postgres>>::decode(value)?;
+
+                Ok(Self::String(s))
+            } else if typ == PgTypeInfo::with_name("int4") {
+                let n = <i32 as Decode<'_, Postgres>>::decode(value)?;
+
+                Ok(Self::Number(n))
+            } else if typ == PgTypeInfo::with_name("_text") {
+                let arr = Vec::<String>::decode(value)?;
+                let v = arr.into_iter().map(|s| Value::String(s)).collect();
+
+                Ok(Self::Array(v))
+            } else if typ == PgTypeInfo::with_name("_int4") {
+                let arr = Vec::<i32>::decode(value)?;
+                let v = arr.into_iter().map(|n| Value::Number(n)).collect();
+
+                Ok(Self::Array(v))
+            } else {
+                Err("unknown type".into())
+            }
+        }
+    }
+
+    impl Encode<'_, Postgres> for Value {
+        fn produces(&self) -> Option<PgTypeInfo> {
+            match self {
+                Self::Array(a) => {
+                    if a.len() < 1 {
+                        return Some(PgTypeInfo::with_name("_text"));
+                    }
+
+                    match a[0] {
+                        Self::String(_) => Some(PgTypeInfo::with_name("_text")),
+                        Self::Number(_) => Some(PgTypeInfo::with_name("_int4")),
+                        Self::Array(_) => None,
+                    }
+                }
+                Self::String(_) => Some(PgTypeInfo::with_name("text")),
+                Self::Number(_) => Some(PgTypeInfo::with_name("int4")),
+            }
+        }
+
+        fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
+            match self {
+                Value::String(s) => <String as Encode<'_, Postgres>>::encode_by_ref(s, buf),
+                Value::Number(n) => <i32 as Encode<'_, Postgres>>::encode_by_ref(n, buf),
+                Value::Array(arr) => arr.encode(buf),
+            }
+        }
+    }
+
+    impl Type<Postgres> for Value {
+        fn type_info() -> PgTypeInfo {
+            PgTypeInfo::with_name("unknown")
+        }
+
+        fn compatible(ty: &PgTypeInfo) -> bool {
+            [
+                PgTypeInfo::with_name("text"),
+                PgTypeInfo::with_name("_text"),
+                PgTypeInfo::with_name("int4"),
+                PgTypeInfo::with_name("_int4"),
+            ]
+            .contains(ty)
+        }
+    }
+
+    let mut conn = new::<Postgres>().await?;
+
+    let (row,): (Value,) = sqlx::query_as("SELECT $1::text[] as Dummy")
+        .bind(Value::Array(vec![
+            Value::String("Test 0".to_string()),
+            Value::String("Test 1".to_string()),
+        ]))
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(
+        row,
+        Value::Array(vec![
+            Value::String("Test 0".to_string()),
+            Value::String("Test 1".to_string()),
+        ])
+    );
+
+    let (row,): (Value,) = sqlx::query_as("SELECT $1::int4[] as Dummy")
+        .bind(Value::Array(vec![
+            Value::Number(3),
+            Value::Number(2),
+            Value::Number(1),
+        ]))
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(
+        row,
+        Value::Array(vec![Value::Number(3), Value::Number(2), Value::Number(1)])
+    );
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn test_issue_1254() -> anyhow::Result<()> {
     #[derive(sqlx::Type)]
     #[sqlx(type_name = "pair")]
@@ -1233,6 +1647,69 @@ CREATE TABLE issue_1254 (id INT4 PRIMARY KEY, pairs PAIR[]);
         .execute(&mut conn)
         .await?;
     assert_eq!(result.rows_affected(), 1);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn test_advisory_locks() -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dotenv::var("DATABASE_URL")?)
+        .await?;
+
+    let lock1 = Arc::new(PgAdvisoryLock::new("sqlx-postgres-tests-1"));
+    let lock2 = Arc::new(PgAdvisoryLock::new("sqlx-postgres-tests-2"));
+
+    let conn1 = pool.acquire().await?;
+    let mut conn1_lock1 = lock1.acquire(conn1).await?;
+
+    // try acquiring a recursive lock through a mutable reference then dropping
+    drop(lock1.acquire(&mut conn1_lock1).await?);
+
+    let conn2 = pool.acquire().await?;
+    // leak so we can take it across the task boundary
+    let conn2_lock2 = lock2.acquire(conn2).await?.leak();
+
+    sqlx_rt::spawn({
+        let lock1 = lock1.clone();
+        let lock2 = lock2.clone();
+
+        async move {
+            let conn2_lock2 = lock1.try_acquire(conn2_lock2).await?.right_or_else(|_| {
+                panic!(
+                    "acquired lock but wasn't supposed to! Key: {:?}",
+                    lock1.key()
+                )
+            });
+
+            let (conn2, released) = lock2.force_release(conn2_lock2).await?;
+            assert!(released);
+
+            // acquire both locks but let the pool release them
+            let conn2_lock1 = lock1.acquire(conn2).await?;
+            let _conn2_lock1and2 = lock2.acquire(conn2_lock1).await?;
+
+            anyhow::Ok(())
+        }
+    });
+
+    // acquire lock2 on conn1, we leak the lock1 guard so we can manually release it before lock2
+    let conn1_lock1and2 = lock2.acquire(conn1_lock1.leak()).await?;
+
+    // release lock1 while holding lock2
+    let (conn1_lock2, released) = lock1.force_release(conn1_lock1and2).await?;
+    assert!(released);
+
+    let conn1 = conn1_lock2.release_now().await?;
+
+    // acquire both locks to be sure they were released
+    {
+        let conn1_lock1 = lock1.acquire(conn1).await?;
+        let _conn1_lock1and2 = lock2.acquire(conn1_lock1).await?;
+    }
+
+    pool.close().await;
 
     Ok(())
 }

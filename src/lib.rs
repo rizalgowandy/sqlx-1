@@ -23,6 +23,7 @@ pub use sqlx_core::from_row::FromRow;
 pub use sqlx_core::pool::{self, Pool};
 pub use sqlx_core::query::{query, query_with};
 pub use sqlx_core::query_as::{query_as, query_as_with};
+pub use sqlx_core::query_builder::{self, QueryBuilder};
 pub use sqlx_core::query_scalar::{query_scalar, query_scalar_with};
 pub use sqlx_core::row::Row;
 pub use sqlx_core::statement::Statement;
@@ -30,6 +31,7 @@ pub use sqlx_core::transaction::{Transaction, TransactionManager};
 pub use sqlx_core::type_info::TypeInfo;
 pub use sqlx_core::types::Type;
 pub use sqlx_core::value::{Value, ValueRef};
+pub use sqlx_core::Either;
 
 #[doc(inline)]
 pub use sqlx_core::error::{self, Error, Result};
